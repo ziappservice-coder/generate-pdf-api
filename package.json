@@ -1,10 +1,13 @@
 {
   "name": "generate-pdf-api",
-  "version": "1.0.0",
-  "description": "基礎忠恕母堂申請表 PDF 產生 API",
+  "version": "2.0.0",
+  "description": "基礎忠恕母堂申請表 PDF 產生 API（Google Service Account 直接呼叫）",
   "type": "module",
   "engines": {
     "node": ">=18"
+  },
+  "dependencies": {
+    "googleapis": "^144.0.0"
   },
   "scripts": {
     "dev": "vercel dev"

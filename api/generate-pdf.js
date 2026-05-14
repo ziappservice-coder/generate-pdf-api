@@ -1,122 +1,176 @@
 // ============================================================
 //  母堂申請表 PDF 產生 API  ─  Vercel Serverless Function
-//  職責：
-//    1. 接收 Glide 的 POST 請求
-//    2. 呼叫 Google Apps Script（自動追蹤 302）產生 PDF
-//    3. 將結果回寫 Glide（mutateTables）
-//    4. 回傳 JSON 給 Glide
+//  直接使用 Google Service Account 呼叫 Docs / Drive API
+//  完全不依賴 Google Apps Script
 // ============================================================
+
+import { google } from 'googleapis';
+import { Readable } from 'stream';
 
 export default async function handler(req, res) {
   // ── CORS ──────────────────────────────────────────────────
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
 
   if (req.method === 'OPTIONS') return res.status(200).end();
   if (req.method !== 'POST') {
     return res.status(405).json({ success: false, error: 'Method not allowed' });
   }
 
-  // ── 環境變數 ───────────────────────────────────────────────
-  const APPS_SCRIPT_URL  = process.env.APPS_SCRIPT_URL;
-  const APPS_SCRIPT_KEY  = process.env.APPS_SCRIPT_KEY;
-  const GLIDE_API_TOKEN  = process.env.GLIDE_API_TOKEN;
-  const GLIDE_APP_ID     = process.env.GLIDE_APP_ID;
-  const GLIDE_TABLE_NAME = process.env.GLIDE_TABLE_NAME;
-  const API_KEY          = process.env.API_KEY;           // Vercel 端的 API Key
-
   // ── API Key 驗證 ───────────────────────────────────────────
   const body       = req.body || {};
   const requestKey = req.headers['x-api-key'] || body.apiKey || '';
 
-  if (API_KEY && requestKey !== API_KEY) {
+  if (process.env.API_KEY && requestKey !== process.env.API_KEY) {
     return res.status(401).json({ success: false, error: 'Unauthorized' });
   }
 
-  // ── 必填欄位檢查 ───────────────────────────────────────────
   if (!body.rowID) {
     return res.status(400).json({ success: false, error: 'rowID is required' });
   }
 
   try {
-    // ── Step 1：呼叫 Apps Script 產生 PDF ─────────────────────
-    console.log('[1] 呼叫 Apps Script, rowID:', body.rowID);
-
-    const scriptUrl = `${APPS_SCRIPT_URL}?apiKey=${APPS_SCRIPT_KEY}`;
-    const scriptRes = await fetch(scriptUrl, {
-      method:   'POST',
-      headers:  { 'Content-Type': 'application/json' },
-      body:     JSON.stringify(body),
-      redirect: 'follow',            // ← 關鍵：自動追蹤 Google 的 302
+    // ── Google Auth（Service Account）─────────────────────────
+    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: [
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/documents',
+      ],
     });
 
-    if (!scriptRes.ok) {
-      const errText = await scriptRes.text();
-      console.error('[Apps Script 錯誤]', scriptRes.status, errText);
-      throw new Error(`Apps Script 回應 ${scriptRes.status}: ${errText}`);
-    }
+    const authClient = await auth.getClient();
+    const drive      = google.drive({ version: 'v3', auth: authClient });
+    const docs       = google.docs({ version: 'v1', auth: authClient });
 
-    const pdfResult = await scriptRes.json();
-    console.log('[2] PDF 產生結果:', pdfResult);
+    const TEMPLATE_DOC_ID  = process.env.TEMPLATE_DOC_ID
+                             || '1DNW4JDp5oDw1tPwAr1Z9oMHWrKNyL3p66fxWyWWtSmk';
+    const OUTPUT_FOLDER_ID = process.env.OUTPUT_FOLDER_ID || null;
 
-    if (!pdfResult.success) {
-      throw new Error(pdfResult.error || 'Apps Script 回傳失敗');
-    }
+    // ── Step 1：複製範本文件 ───────────────────────────────────
+    const masterName = body.Master_Name || 'unknown';
+    const timestamp  = new Date()
+                       .toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
+                       .replace(/[\/:]/g, '-').replace(/\s/g, '_');
+    const copyName   = `母堂申請表_${masterName}_${timestamp}`;
 
-    // ── Step 2：回寫 Glide ────────────────────────────────────
-    console.log('[3] 回寫 Glide, rowID:', body.rowID);
+    console.log('[1] 複製範本:', TEMPLATE_DOC_ID);
+    const copyRes = await drive.files.copy({
+      fileId:      TEMPLATE_DOC_ID,
+      requestBody: {
+        name:    copyName,
+        parents: OUTPUT_FOLDER_ID ? [OUTPUT_FOLDER_ID] : undefined,
+      },
+    });
+    const copyId = copyRes.data.id;
+    console.log('[1] 副本 ID:', copyId);
 
-    const glidePayload = {
-      appID: GLIDE_APP_ID,
-      mutations: [
-        {
-          kind:      'set-columns-in-row',
-          tableName: GLIDE_TABLE_NAME,
-          rowID:     body.rowID,
-          columnValues: {
-            genApplyPDF:  pdfResult.downloadUrl,
-            APIResponse:  JSON.stringify(pdfResult),
-          },
-        },
-      ],
+    // ── Step 2：批次替換所有 {{佔位符}} ───────────────────────
+    const fields = [
+      'Paper_Send_Date', 'Unit',    'Temple_NO',
+      'Master_Name',     'Master_Male', 'Master_BD', 'Master_TD', 'Master_CD',
+      'Sub_Name',        'Sub_Male',    'Sub_BD',    'Sub_TD',    'Sub_CD',
+      'Address', 'TEL1', 'TEL2',
+      'JOB', 'EDU', 'SKI',
+      'Open_Date', 'Open_LY', 'Open_LD',
+      'Temple_Area', 'Temple_Name', 'Temple_Name2',
+      'ApplyMan', 'TaoMaster', 'TaoMasterLeader', 'Approve_Sign',
+      'Vitae', 'Check1', 'Check2',
+    ];
+
+    const requests = fields.map(key => ({
+      replaceAllText: {
+        containsText: { text: `{{${key}}}`, matchCase: true },
+        replaceText:  (body[key] !== undefined && body[key] !== null)
+                      ? String(body[key]) : '',
+      },
+    }));
+
+    console.log('[2] 替換', requests.length, '個欄位...');
+    await docs.documents.batchUpdate({
+      documentId:  copyId,
+      requestBody: { requests },
+    });
+
+    // ── Step 3：匯出為 PDF（arraybuffer）──────────────────────
+    console.log('[3] 匯出 PDF...');
+    const pdfRes = await drive.files.export(
+      { fileId: copyId, mimeType: 'application/pdf' },
+      { responseType: 'arraybuffer' }
+    );
+    const pdfBuffer = Buffer.from(pdfRes.data);
+
+    // ── Step 4：上傳 PDF 到 Drive ─────────────────────────────
+    const pdfName = `${copyName}.pdf`;
+    console.log('[4] 上傳 PDF:', pdfName);
+
+    const uploadRes = await drive.files.create({
+      requestBody: {
+        name:     pdfName,
+        mimeType: 'application/pdf',
+        parents:  OUTPUT_FOLDER_ID ? [OUTPUT_FOLDER_ID] : undefined,
+      },
+      media: {
+        mimeType: 'application/pdf',
+        body:     Readable.from(pdfBuffer),
+      },
+    });
+    const pdfId = uploadRes.data.id;
+
+    // ── Step 5：設定任何人可檢視 ──────────────────────────────
+    await drive.permissions.create({
+      fileId:      pdfId,
+      requestBody: { role: 'reader', type: 'anyone' },
+    });
+
+    // ── Step 6：刪除暫存 Google Doc 副本 ──────────────────────
+    await drive.files.delete({ fileId: copyId });
+    console.log('[5] 暫存文件已刪除');
+
+    // ── 組合回傳結果 ───────────────────────────────────────────
+    const result = {
+      success:     true,
+      fileId:      pdfId,
+      fileName:    pdfName,
+      downloadUrl: `https://drive.google.com/uc?export=download&id=${pdfId}`,
+      viewUrl:     `https://drive.google.com/file/d/${pdfId}/view`,
+      directUrl:   `https://drive.google.com/uc?id=${pdfId}`,
     };
 
+    // ── Step 7：回寫 Glide ────────────────────────────────────
+    console.log('[6] 回寫 Glide, rowID:', body.rowID);
     const glideRes = await fetch(
       'https://api.glideapp.io/api/function/mutateTables',
       {
         method:  'POST',
         headers: {
           'Content-Type':  'application/json',
-          'Authorization': `Bearer ${GLIDE_API_TOKEN}`,
+          'Authorization': `Bearer ${process.env.GLIDE_API_TOKEN}`,
         },
-        body: JSON.stringify(glidePayload),
+        body: JSON.stringify({
+          appID: process.env.GLIDE_APP_ID,
+          mutations: [{
+            kind:      'set-columns-in-row',
+            tableName: process.env.GLIDE_TABLE_NAME,
+            rowID:     body.rowID,
+            columnValues: {
+              genApplyPDF: result.downloadUrl,
+              APIResponse: JSON.stringify(result),
+            },
+          }],
+        }),
       }
     );
 
-    const glideBody = await glideRes.text();
-    console.log('[4] Glide 回應:', glideRes.status, glideBody);
+    console.log('[6] Glide 回應:', glideRes.status, await glideRes.text());
 
-    if (!glideRes.ok) {
-      console.warn('[Glide 回寫失敗] Status:', glideRes.status, 'Body:', glideBody);
-      // 回寫失敗不中斷流程，PDF 已產生成功
-    }
-
-    // ── Step 3：回傳給 Glide Call API ─────────────────────────
-    return res.status(200).json({
-      success:      true,
-      fileId:       pdfResult.fileId,
-      fileName:     pdfResult.fileName,
-      downloadUrl:  pdfResult.downloadUrl,
-      viewUrl:      pdfResult.viewUrl,
-      glideWritten: glideRes.ok,
-    });
+    return res.status(200).json({ ...result, glideWritten: glideRes.ok });
 
   } catch (err) {
     console.error('[致命錯誤]', err.message);
-    return res.status(500).json({
-      success: false,
-      error:   err.message,
-    });
+    console.error(err.stack);
+    return res.status(500).json({ success: false, error: err.message });
   }
 }
