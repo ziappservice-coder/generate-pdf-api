@@ -1,11 +1,23 @@
 // ============================================================
 //  母堂申請表 PDF 產生 API  ─  Vercel Serverless Function
-//  直接使用 Google Service Account 呼叫 Docs / Drive API
-//  完全不依賴 Google Apps Script
+//  流程：
+//    1. 讀取 repo 內的 template.docx
+//    2. docxtemplater 填入欄位
+//    3. 上傳填好的 DOCX 到 Service Account 的 Drive（轉 Google Doc）
+//    4. 匯出為 PDF
+//    5. 上傳 PDF 到 Drive，設定公開連結
+//    6. 回寫 Glide
 // ============================================================
 
-import { google } from 'googleapis';
-import { Readable } from 'stream';
+import { google }    from 'googleapis';
+import Docxtemplater from 'docxtemplater';
+import PizZip        from 'pizzip';
+import { Readable }  from 'stream';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export default async function handler(req, res) {
   // ── CORS ──────────────────────────────────────────────────
@@ -30,69 +42,27 @@ export default async function handler(req, res) {
     return res.status(400).json({ success: false, error: 'rowID is required' });
   }
 
-  // ── 環境變數完整性檢查 ─────────────────────────────────────
-  const requiredEnvs = [
-    'GOOGLE_SERVICE_ACCOUNT_JSON',
-    'GLIDE_API_TOKEN',
-    'GLIDE_APP_ID',
-    'GLIDE_TABLE_NAME',
-    'API_KEY',
-  ];
-  const missingEnvs = requiredEnvs.filter(k => !process.env[k]);
+  // ── 環境變數檢查 ───────────────────────────────────────────
+  const requiredEnvs = ['GOOGLE_SERVICE_ACCOUNT_JSON', 'GLIDE_API_TOKEN', 'GLIDE_APP_ID', 'GLIDE_TABLE_NAME'];
+  const missingEnvs  = requiredEnvs.filter(k => !process.env[k]);
   if (missingEnvs.length > 0) {
-    console.error('[環境變數缺少]', missingEnvs);
-    return res.status(500).json({
-      success: false,
-      error:   `缺少環境變數：${missingEnvs.join(', ')}`,
-    });
+    return res.status(500).json({ success: false, error: `缺少環境變數：${missingEnvs.join(', ')}` });
   }
 
   try {
-    // ── Google Auth（Service Account）─────────────────────────
-    let credentials;
-    try {
-      credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
-    } catch (e) {
-      return res.status(500).json({
-        success: false,
-        error:   'GOOGLE_SERVICE_ACCOUNT_JSON 格式錯誤，請確認是完整的 JSON 字串',
-      });
-    }
-    const auth = new google.auth.GoogleAuth({
-      credentials,
-      scopes: [
-        'https://www.googleapis.com/auth/drive',
-        'https://www.googleapis.com/auth/documents',
-      ],
+    // ── Step 1：讀取並填入 DOCX 範本 ──────────────────────────
+    console.log('[1] 讀取 DOCX 範本...');
+    const templatePath   = join(__dirname, 'template', 'template.docx');
+    const templateBuffer = readFileSync(templatePath);
+
+    const zip = new PizZip(templateBuffer);
+    const doc = new Docxtemplater(zip, {
+      paragraphLoop: true,
+      linebreaks:    true,
+      delimiters:    { start: '{{', end: '}}' },
     });
 
-    const authClient = await auth.getClient();
-    const drive      = google.drive({ version: 'v3', auth: authClient });
-    const docs       = google.docs({ version: 'v1', auth: authClient });
-
-    const TEMPLATE_DOC_ID  = process.env.TEMPLATE_DOC_ID
-                             || '1DNW4JDp5oDw1tPwAr1Z9oMHWrKNyL3p66fxWyWWtSmk';
-    const OUTPUT_FOLDER_ID = process.env.OUTPUT_FOLDER_ID || null;
-
-    // ── Step 1：複製範本文件 ───────────────────────────────────
-    const masterName = body.Master_Name || 'unknown';
-    const timestamp  = new Date()
-                       .toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
-                       .replace(/[\/:]/g, '-').replace(/\s/g, '_');
-    const copyName   = `母堂申請表_${masterName}_${timestamp}`;
-
-    console.log('[1] 複製範本:', TEMPLATE_DOC_ID);
-    const copyRes = await drive.files.copy({
-      fileId:      TEMPLATE_DOC_ID,
-      requestBody: {
-        name:    copyName,
-        parents: OUTPUT_FOLDER_ID ? [OUTPUT_FOLDER_ID] : undefined,
-      },
-    });
-    const copyId = copyRes.data.id;
-    console.log('[1] 副本 ID:', copyId);
-
-    // ── Step 2：批次替換所有 {{佔位符}} ───────────────────────
+    // 欄位對應（未提供的欄位填空字串）
     const fields = [
       'Paper_Send_Date', 'Unit',    'Temple_NO',
       'Master_Name',     'Master_Male', 'Master_BD', 'Master_TD', 'Master_CD',
@@ -104,67 +74,93 @@ export default async function handler(req, res) {
       'ApplyMan', 'TaoMaster', 'TaoMasterLeader', 'Approve_Sign',
       'Vitae', 'Check1', 'Check2',
     ];
-
-    const requests = fields.map(key => ({
-      replaceAllText: {
-        containsText: { text: `{{${key}}}`, matchCase: true },
-        replaceText:  (body[key] !== undefined && body[key] !== null)
-                      ? String(body[key]) : '',
-      },
-    }));
-
-    console.log('[2] 替換', requests.length, '個欄位...');
-    await docs.documents.batchUpdate({
-      documentId:  copyId,
-      requestBody: { requests },
+    const data = {};
+    fields.forEach(k => {
+      data[k] = (body[k] !== undefined && body[k] !== null) ? String(body[k]) : '';
     });
 
-    // ── Step 3：匯出為 PDF（arraybuffer）──────────────────────
+    doc.render(data);
+    const filledBuffer = doc.getZip().generate({ type: 'nodebuffer' });
+    console.log('[1] DOCX 填入完成，大小:', filledBuffer.length, 'bytes');
+
+    // ── Step 2：Google Auth（Service Account）──────────────────
+    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    const auth        = new google.auth.GoogleAuth({
+      credentials,
+      scopes: [
+        'https://www.googleapis.com/auth/drive',
+        'https://www.googleapis.com/auth/documents',
+      ],
+    });
+    const drive = google.drive({ version: 'v3', auth });
+
+    // ── Step 3：上傳 DOCX → 轉為 Google Doc ───────────────────
+    const masterName  = body.Master_Name || 'unknown';
+    const timestamp   = new Date()
+                        .toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' })
+                        .replace(/[/:]/g, '-').replace(/\s/g, '_');
+    const docName     = `母堂申請表_${masterName}_${timestamp}`;
+
+    console.log('[2] 上傳 DOCX 並轉為 Google Doc...');
+    const uploadRes = await drive.files.create({
+      requestBody: {
+        name:     docName,
+        mimeType: 'application/vnd.google-apps.document',  // 轉為 Google Doc
+      },
+      media: {
+        mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        body:     Readable.from(filledBuffer),
+      },
+    });
+    const tempDocId = uploadRes.data.id;
+    console.log('[2] Google Doc ID:', tempDocId);
+
+    // ── Step 4：匯出為 PDF ─────────────────────────────────────
     console.log('[3] 匯出 PDF...');
-    const pdfRes = await drive.files.export(
-      { fileId: copyId, mimeType: 'application/pdf' },
+    const pdfRes    = await drive.files.export(
+      { fileId: tempDocId, mimeType: 'application/pdf' },
       { responseType: 'arraybuffer' }
     );
     const pdfBuffer = Buffer.from(pdfRes.data);
 
-    // ── Step 4：上傳 PDF 到 Drive ─────────────────────────────
-    const pdfName = `${copyName}.pdf`;
-    console.log('[4] 上傳 PDF:', pdfName);
+    // ── Step 5：上傳 PDF 到 Drive ─────────────────────────────
+    const pdfName       = `${docName}.pdf`;
+    const OUTPUT_FOLDER = process.env.OUTPUT_FOLDER_ID || null;
 
-    const uploadRes = await drive.files.create({
+    console.log('[4] 上傳 PDF:', pdfName);
+    const pdfUploadRes = await drive.files.create({
       requestBody: {
         name:     pdfName,
         mimeType: 'application/pdf',
-        parents:  OUTPUT_FOLDER_ID ? [OUTPUT_FOLDER_ID] : undefined,
+        parents:  OUTPUT_FOLDER ? [OUTPUT_FOLDER] : undefined,
       },
       media: {
         mimeType: 'application/pdf',
         body:     Readable.from(pdfBuffer),
       },
     });
-    const pdfId = uploadRes.data.id;
+    const pdfId = pdfUploadRes.data.id;
 
-    // ── Step 5：設定任何人可檢視 ──────────────────────────────
+    // ── Step 6：設定公開連結 ───────────────────────────────────
     await drive.permissions.create({
       fileId:      pdfId,
       requestBody: { role: 'reader', type: 'anyone' },
     });
 
-    // ── Step 6：刪除暫存 Google Doc 副本 ──────────────────────
-    await drive.files.delete({ fileId: copyId });
-    console.log('[5] 暫存文件已刪除');
+    // ── Step 7：刪除暫存 Google Doc ───────────────────────────
+    await drive.files.delete({ fileId: tempDocId });
+    console.log('[5] 暫存 Google Doc 已刪除');
 
-    // ── 組合回傳結果 ───────────────────────────────────────────
+    // ── 結果 ──────────────────────────────────────────────────
     const result = {
       success:     true,
       fileId:      pdfId,
       fileName:    pdfName,
       downloadUrl: `https://drive.google.com/uc?export=download&id=${pdfId}`,
       viewUrl:     `https://drive.google.com/file/d/${pdfId}/view`,
-      directUrl:   `https://drive.google.com/uc?id=${pdfId}`,
     };
 
-    // ── Step 7：回寫 Glide ────────────────────────────────────
+    // ── Step 8：回寫 Glide ────────────────────────────────────
     console.log('[6] 回寫 Glide, rowID:', body.rowID);
     const glideRes = await fetch(
       'https://api.glideapp.io/api/function/mutateTables',
@@ -188,8 +184,7 @@ export default async function handler(req, res) {
         }),
       }
     );
-
-    console.log('[6] Glide 回應:', glideRes.status, await glideRes.text());
+    console.log('[6] Glide 回應:', glideRes.status);
 
     return res.status(200).json({ ...result, glideWritten: glideRes.ok });
 
