@@ -30,9 +30,34 @@ export default async function handler(req, res) {
     return res.status(400).json({ success: false, error: 'rowID is required' });
   }
 
+  // ── 環境變數完整性檢查 ─────────────────────────────────────
+  const requiredEnvs = [
+    'GOOGLE_SERVICE_ACCOUNT_JSON',
+    'GLIDE_API_TOKEN',
+    'GLIDE_APP_ID',
+    'GLIDE_TABLE_NAME',
+    'API_KEY',
+  ];
+  const missingEnvs = requiredEnvs.filter(k => !process.env[k]);
+  if (missingEnvs.length > 0) {
+    console.error('[環境變數缺少]', missingEnvs);
+    return res.status(500).json({
+      success: false,
+      error:   `缺少環境變數：${missingEnvs.join(', ')}`,
+    });
+  }
+
   try {
     // ── Google Auth（Service Account）─────────────────────────
-    const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    let credentials;
+    try {
+      credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+    } catch (e) {
+      return res.status(500).json({
+        success: false,
+        error:   'GOOGLE_SERVICE_ACCOUNT_JSON 格式錯誤，請確認是完整的 JSON 字串',
+      });
+    }
     const auth = new google.auth.GoogleAuth({
       credentials,
       scopes: [
