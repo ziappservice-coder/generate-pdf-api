@@ -1,0 +1,12 @@
+{
+  "name": "generate-pdf-api",
+  "version": "1.0.0",
+  "description": "基礎忠恕母堂申請表 PDF 產生 API",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}
