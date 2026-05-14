@@ -94,6 +94,24 @@ export default async function handler(req, res) {
     });
     const drive = google.drive({ version: 'v3', auth });
 
+    // ── Step 2.5：清除舊檔案（釋放空間）─────────────────────────
+    console.log('[2] 清除舊檔案...');
+    try {
+      const listRes = await drive.files.list({
+        q:      `name contains '母堂申請表'`,
+        fields: 'files(id, name)',
+        spaces: 'drive',
+      });
+      const oldFiles = listRes.data.files || [];
+      console.log(`[2] 找到 ${oldFiles.length} 個舊檔案，清除中...`);
+      for (const f of oldFiles) {
+        await drive.files.delete({ fileId: f.id });
+        console.log('[2] 已刪除:', f.name);
+      }
+    } catch (cleanErr) {
+      console.warn('[2] 清除舊檔案失敗（不影響流程）:', cleanErr.message);
+    }
+
     // ── Step 3：上傳 DOCX → 轉為 Google Doc ───────────────────
     const masterName  = body.Master_Name || 'unknown';
     const timestamp   = new Date()
